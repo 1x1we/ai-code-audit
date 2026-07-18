@@ -1,0 +1,16 @@
+{
+  "name": "ai-code-audit",
+  "version": "8.0",
+  "description": "商业级代码审计门禁 — 包生态验证 + 上下文感知 + 置信度评分 + 三管过滤",
+  "installedAt": "N/A",
+  "source": "custom",
+  "capabilities": [
+    "多语言包名验证（PyPI/npm/NuGet/Go/Rust stdlib）",
+    "项目命名空间自动识别",
+    "上下文感知魔法数字检测",
+    "CLI vs 库 调试残留智能区分",
+    "置信度加权评分",
+    "三管输出过滤（strict/normal/release）",
+    "实时自测试"
+  ]
+}
