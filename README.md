@@ -392,16 +392,3 @@ MIT License — 可自由使用、修改、分发。
 ## 十五、联系与贡献
 
 如果你发现误报、漏报，或有新的检测需求，欢迎提交 Issue 或 PR。我们尤其欢迎基于真实项目的淬炼反馈——正是 voicebutler 这样的真实项目，让 v8.9/v8.10 的命令注入检测达到了商业级可用标准。
-
----
-
-## 十六、一键发布到 GitHub
-
-仓库根目录已内置 `publish.bat`，**在本机双击即可一键推送**（无需记命令）：
-
-1. 确保本机已安装 Git 且已登录 GitHub（凭据助手已缓存 token / 已配置 SSH）。
-2. 双击 `publish.bat`。
-3. 脚本自动：检查工作树是否干净 → 缺失则补建 `origin` 远程 → 本地分支改名 `main` → `git push -u origin main --force-with-lease`。
-4. 窗口显示 `PUBLISH OK` 即成功；若显示 `PUSH FAILED` 多为 GitHub 登录/token 问题，按提示处理即可。
-
-> 说明：`--force-with-lease` 会用本地 v8.13 覆盖 GitHub 上旧的 v8.10 提交历史（二者无共同祖先），属于预期的"重新上传"。脚本为纯 ASCII + CRLF + 无 BOM，规避 Windows bat 中文路径一闪而过的经典坑。
