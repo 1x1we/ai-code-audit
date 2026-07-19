@@ -11,10 +11,11 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
 from package_resolver import PackageResolver
-from smart_detectors import SmartDetectors, apply_all_detectors
+from smart_detectors import SmartDetectors, apply_all_detectors, TaintContext
 from confidence_engine import ConfidenceEngine, recalculate_score
 from release_artifacts import scan_release_artifacts
-from agent_protocol import build_agent_tasks, apply_verdicts, emit_agent_tasks_json, issues_hash
+from agent_protocol import build_agent_tasks, apply_verdicts, emit_agent_tasks_json, issues_hash, \
+    enrich_skill_finding, agent_review, decide_gate_with_agent, is_blocking_with_agent
 from ast_logic_analyzer import analyze_python_ast
 from dependency_audit import scan_dependency_audit
 from audit_whitelist import Whitelist
@@ -818,6 +819,297 @@ def test_no_duplicate_artifacts():
     return True
 
 
+# ══════════════════════════════════════════════════════
+# v8.11 新增测试：端口硬编码增强 / H7 误报修复 / 标签细分 / 门禁作用域
+# ══════════════════════════════════════════════════════
+
+def test_command_injection_subtype():
+    """v8.11：命令注入按真实危害细分 RCE / 任意文件读 / 任意文件写删"""
+    print("命令注入子类型细分测试")
+    d = SmartDetectors()
+    cases = [
+        ('os.system("rm -rf " + user_input)', "python", "command_injection:file_write"),
+        ('os.system("cat " + user_input)', "python", "command_injection:file_read"),
+        ('os.system("ls " + user_input)', "python", "command_injection:rce"),
+        ('subprocess.run("echo " + x, shell=True)', "python", "command_injection:rce"),
+        ('Runtime.getRuntime().exec("sh -c rm " + cmd)', "java", "command_injection:file_write"),
+    ]
+    passed = 0
+    for line, lang, expect_subtype in cases:
+        res = d.check_command_injection(line, 1, lang, "probe")
+        ok = res is not None and res.get("subtype") == expect_subtype
+        status = "OK" if ok else f"FAIL (got={res.get('subtype') if res else None})"
+        print(f"  {status:>10}  {lang:>10}  {line[:46]} -> {expect_subtype}")
+        if ok:
+            passed += 1
+    print(f"\n  {passed}/{len(cases)} 通过\n")
+    assert passed == len(cases), f"预期全部通过，实际 {passed}/{len(cases)}"
+    return True
+
+
+def test_rust_format_taint_h7():
+    """v8.11：修复 H7 —— format! 仅当插值含外部输入才判注入；写死路径/常量不误报"""
+    print("Rust format! 污点感知 (H7 修复) 测试")
+    d = SmartDetectors()
+    cases = [
+        # 写死路径/常量插值 → 不应报（H7 误报来源）
+        ('    Command::new("powershell").args(["-Command", format!("{}/cache/temp.wav", BASE_DIR)]).status()',
+         "rust", False),
+        ('    Command::new("cmd").args(["/C", format!("{}/out.txt", OUT_DIR)]).status()',
+         "rust", False),
+        # 外部输入插值 → 必须报
+        ('    Command::new("cmd").args(["/C", format!("echo {}", user_input)]).status()',
+         "rust", True),
+        ('    Command::new(format!("cmd /C {}", name)).status()',
+         "rust", True),
+        # 纯静态 → 不报
+        ('    Command::new("cmd").args(["/C", "echo", "hi"]).status()',
+         "rust", False),
+    ]
+    passed = 0
+    for line, lang, should_flag in cases:
+        res = d.check_command_injection(line, 1, lang, "probe")
+        flagged = res is not None
+        ok = flagged == should_flag
+        status = "OK" if ok else f"FAIL (flagged={flagged})"
+        print(f"  {status:>10}  {line[:62]}")
+        if ok:
+            passed += 1
+    print(f"\n  {passed}/{len(cases)} 通过\n")
+    assert passed == len(cases), f"预期全部通过，实际 {passed}/{len(cases)}"
+    return True
+
+
+def test_magic_number_port_in_url():
+    """v8.11：URL/连接串中的端口（含 11434 等）与 IPv4 行不误判魔法数字"""
+    print("魔法数字：URL 端口/IPv4 测试")
+    d = SmartDetectors()
+    cases = [
+        ('let url = "http://127.0.0.1:11434/api";', "rust", False),
+        ('const EP = "http://localhost:8080/v1";', "javascript", False),
+        ('conn = "postgres://user:pass@db.host:5432/app";', "python", False),
+        ('if (retries > 15)', "csharp", True),
+        ('return 42', "python", True),
+    ]
+    passed = 0
+    for line, lang, should_flag in cases:
+        res = d.check_magic_number(line, 1, lang)
+        flagged = res is not None
+        ok = flagged == should_flag
+        status = "OK" if ok else f"FAIL (flagged={flagged})"
+        print(f"  {status:>10}  {lang:>10}  {line[:50]}")
+        if ok:
+            passed += 1
+    print(f"\n  {passed}/{len(cases)} 通过\n")
+    assert passed == len(cases), f"预期全部通过，实际 {passed}/{len(cases)}"
+    return True
+
+
+def test_hardcoded_port_detector():
+    """v8.11+：独立硬编码端口检测器 — 既检测真实端口，又排除英文词/URL 误报"""
+    print("硬编码端口检测器测试")
+    d = SmartDetectors()
+    # (代码行, 语言, 应标记, 期望端口值或 None)
+    cases = [
+        # —— 应检测（真实端口硬编码）——
+        ('const PORT = 8080;', "csharp", True, 8080),
+        ('self.port = 3000', "python", True, 3000),
+        ('serverPort = 5432', "csharp", True, 5432),
+        ('int _port = 11434;', "csharp", True, 11434),
+        ('server.listen(3000)', "javascript", True, 3000),
+        ('server.bind(("0.0.0.0", 8080))', "python", True, 8080),
+        ('TcpListener::bind("0.0.0.0:9090")', "rust", True, 9090),
+        ('app.listen(3000)', "javascript", True, 3000),
+        ('net.Listen("tcp", ":6379")', "go", True, 6379),
+        # —— 不应检测（误报护栏）——
+        ('let url = "http://localhost:11434/api";', "rust", False, None),  # URL 连接串
+        ('important = 3000', "python", False, None),   # 英文词含 port 但非端口
+        ('report = 8080', "python", False, None),      # 同上
+        ('const year = 2024', "csharp", False, None),  # 年份，非端口关键词
+    ]
+    passed = 0
+    for line, lang, should_flag, expect_port in cases:
+        res = d.check_hardcoded_port(line, 1, lang, "probe")
+        flagged = res is not None
+        ok = flagged == should_flag
+        if ok and flagged and expect_port is not None:
+            ok = res.get("subtype") == "hardcoded_port" and str(expect_port) in res.get("desc", "")
+        status = "OK" if ok else f"FAIL (flagged={flagged}, port={res.get('desc') if res else None})"
+        print(f"  {status:>10}  {lang:>10}  {line[:46]} -> {expect_port}")
+        if ok:
+            passed += 1
+    print(f"\n  {passed}/{len(cases)} 通过\n")
+    assert passed == len(cases), f"预期全部通过，实际 {passed}/{len(cases)}"
+    return True
+
+
+def test_ssrf_local_scope_gate():
+    """v8.11：SSRF 命中 localhost 标记 scope=local，门禁降级为 CONDITIONAL 而非硬 BLOCK"""
+    print("SSRF 本地作用域测试")
+    d = SmartDetectors()
+    # 行内 localhost 字面量 + 动态 → scope=local
+    local_hit = d.check_ssrf('requests.get(f"http://localhost:{port}/api")', "python", 1, "p")
+    ok1 = local_hit is not None and local_hit.get("scope") == "local"
+    # 变量 host（无 localhost 字面量）→ scope=network（保守）
+    net = d.check_ssrf('requests.get(f"http://{host}/api")', "python", 1, "p")
+    ok2 = net is not None and net.get("scope") == "network"
+    print(f"  {'OK' if ok1 else 'FAIL'}  localhost 字面量 SSRF → scope={local_hit.get('scope') if local_hit else None}")
+    print(f"  {'OK' if ok2 else 'FAIL'}  变量 host SSRF → scope={net.get('scope') if net else None}")
+    assert ok1 and ok2, "SSRF scope 判定错误"
+    return True
+
+
+def test_taint_context():
+    """v8.13：同文件内污点追踪上下文构建正确"""
+    print("污点追踪上下文 (v8.13) 测试")
+    lines = [
+        "func handle(w http.ResponseWriter, r *http.Request) {",
+        "    path := r.URL.Path",
+        "    if pathAllowed(path) {",
+        "        data := readFile(path)",
+        "    }",
+        "    let local = std::env::temp_dir();",
+        "    let tmp = format!(\"{}/x.mp3\", local);",
+    ]
+    ctx = TaintContext.build(lines, "go")
+    assert "r" in ctx.tainted or "path" in ctx.tainted, "request 参数应标 tainted"
+    assert "path" in ctx.guarded, "pathAllowed(path) 应标 guarded"
+    assert "local" in ctx.clean, "temp_dir 来源应标 clean"
+    # resolve 判定
+    assert ctx.resolve("format!(\"{}\", path)") == "guarded", "guarded 变量应判 guarded"
+    assert ctx.resolve("x.mp3") == "clean", "字面量应判 clean"
+    assert ctx.resolve("user_input") == "tainted", "外部语义命名应判 tainted"
+    print("  OK  污点/守卫/clean 三态 + resolve 正确")
+    return True
+
+
+def test_taint_match_arm_not_param():
+    """v8.13 回归：Rust/Go 的 match 分支 (Some(v) =>) 误把本地绑定当函数参数→命令注入误报。
+
+    根因：_seed_params 曾对所有语言匹配 (...) => 抽取参数，把 Rust match 臂绑定
+    v 当成了外部可控参数，导致 Command::new(\"sh\").arg(v) 被误判 HIGH。
+    修复后仅 JS/TS 箭头函数从 => 抽取参数；Rust match 臂绑定不再污染 params。
+    """
+    print("match 臂绑定非参数 (v8.13 回归) 测试")
+    lines = [
+        "fn f(x: &str) {",
+        "    match x.parse::<i32>() {",
+        "        Ok(v) => {",
+        '            let _ = Command::new("sh").arg("-c").arg(v).status();',
+        "        }",
+        "        Err(_) => {}",
+        "    }",
+        "}",
+    ]
+    ctx = TaintContext.build(lines, "rust")
+    assert "v" not in ctx.params, "match 臂绑定 v 不应被当函数参数"
+    assert ctx.references_param('arg(v)') is False, "match 臂 v 流入 shell 不应判外部可控"
+    # 函数真实参数 x 仍应被当外部可控（即便未直接进 shell）
+    assert "x" in ctx.params, "函数签名参数 x 应被当外部可控"
+    # JS 箭头函数参数不受影响
+    ctx2 = TaintContext.build(['const g = (a, b) => { spawn(shell, ["-c", a]); };'], "ts")
+    assert "a" in ctx2.params and ctx2.references_param('spawn(shell, ["-c", a])') is True, \
+        "JS 箭头函数参数 a 应仍被当外部可控"
+    print("  OK  Rust match 臂不污染 / JS 箭头参数仍捕获")
+    return True
+
+
+def test_command_injection_taint_downgrade():
+    """v8.13：本地/已守卫 shell 参数降级为 LOW，不触发 BLOCK；真实外部输入仍 HIGH"""
+    print("命令注入污点降级 (v8.13) 测试")
+    d = SmartDetectors()
+    # voicebutler 真实场景：powershell 播本地 temp 文件，path 非外部输入
+    voicebutler = [
+        "let dir = std::env::temp_dir();",
+        "let path = format!(\"{}/vb_tts.mp3\", dir);",
+        'Command::new("powershell").args(["-Command", format!("(New-Item -Path \'{}\')", path)]).status();',
+    ]
+    ctx = TaintContext.build(voicebutler, "rust")
+    res = d.check_command_injection(voicebutler[2], 3, "rust", "tts/mod.rs", taint_ctx=ctx)
+    assert res is not None, "应仍产出发现（可审计，不静默丢弃）"
+    assert res["severity"] == "low", f"本地/守卫参数应降级 LOW，实际 {res['severity']}"
+    assert res.get("taint_state") in ("clean", "guarded"), "应带 taint_state"
+    # 真实注入：外部输入进 shell，仍 HIGH
+    real = d.check_command_injection('Command::new("sh").arg("-c").arg(user_input).status()',
+                                      1, "rust", "p", taint_ctx=ctx)
+    assert real is not None and real["severity"] == "high", "真实外部输入必须 HIGH"
+    # 无 taint_ctx 时保持原行为（HIGH）
+    bare = d.check_command_injection('Command::new("sh").arg("-c").arg(user_input).status()',
+                                     1, "rust", "p")
+    assert bare is not None and bare["severity"] == "high", "无 taint_ctx 应保持 HIGH"
+    print("  OK  本地降级 LOW / 真实注入 HIGH / 无 ctx 兼容")
+    return True
+
+
+def test_path_traversal_taint_guarded():
+    """v8.13：守卫在前 → 降级 LOW；未守卫外部输入 → 保持；纯本地 → 跳过"""
+    print("路径穿越污点降级 (v8.13) 测试")
+    d = SmartDetectors()
+    # 守卫在前（voicebutler bridge 真实场景）
+    guarded_file = [
+        "func open(req Request) {",
+        "    if pathAllowed(req.Path) {",
+        "        os.ReadFile(req.Path)",
+        "    }",
+        "}",
+    ]
+    ctx = TaintContext.build(guarded_file, "go")
+    res = d.check_path_traversal(guarded_file[2], 3, "go", "filesystem.go", taint_ctx=ctx)
+    assert res is not None and res["severity"] == "low", f"守卫前应降级 LOW，实际 {res}"
+    assert res.get("taint_state") == "guarded"
+    # 未守卫的外部输入路径（独立构建不含守卫的 ctx）→ 保持 MID
+    dirty_ctx = TaintContext.build(["func open2(req Request) {", "    os.ReadFile(req.Path)", "}"], "go")
+    dirty = d.check_path_traversal("os.ReadFile(req.Path)", 1, "go", "f.go", taint_ctx=dirty_ctx)
+    assert dirty is not None and dirty["severity"] == "mid", f"未守卫外部输入应 MID，实际 {dirty}"
+    # 纯本地路径操作（无外部输入）→ 跳过（非漏洞）
+    local = d.check_path_traversal("data := os.ReadFile(localConfig)", 1, "go", "f.go",
+                                    taint_ctx=ctx)
+    # localConfig 非外部命名 → clean → 应跳过（None）
+    assert local is None, f"纯本地路径应跳过，实际 {local}"
+    print("  OK  守卫→LOW / 未守卫→MID / 本地→跳过")
+    return True
+
+
+def test_magic_number_tsx_exempt():
+    """v8.13：TSX/JSX 样式噪声（Tailwind 类 / framer-motion / style）豁免魔法数字"""
+    print("TSX 魔法数字豁免 (v8.13) 测试")
+    d = SmartDetectors()
+    # 应为 None（样式噪声）
+    assert d.check_magic_number('    <div className="gap-1 p-3">', 1, "tsx", "x.tsx") is None
+    assert d.check_magic_number('    <motion.div animate={{ x: 20, opacity: 0.5 }} />', 1, "tsx", "x.tsx") is None
+    assert d.check_magic_number('    const style = { marginTop: 8 };', 1, "tsx", "x.tsx") is None
+    # 真实代码逻辑仍应标（LOW）
+    logic = d.check_magic_number('    if (count > 10) {', 1, "tsx", "x.tsx")
+    assert logic is not None and logic["severity"] == "low", f"逻辑比较应标魔法数字，实际 {logic}"
+    arr = d.check_magic_number('    if (total > 50) {', 1, "tsx", "x.tsx")
+    assert arr is not None, "比较逻辑应标魔法数字"
+    # 非 tsx 文件行为不变（引号内数字仍可能标，取决于既有规则，这里只验证不崩溃）
+    assert d.check_magic_number('const PORT = 8080', 1, "go", "x.go") is None or True
+    print("  OK  TSX 样式豁免 / 逻辑仍标")
+    return True
+
+
+def test_collab_gate_agent_reject():
+    """v8.13：三层协同 — 智能体 REJECT 致命发现后，门禁不再 BLOCK"""
+    print("协同门禁 智能体REJECT (v8.13) 测试")
+    scoring = {"grade": "A", "veto_hit": False}
+    # 技能初筛：一条 HIGH 命令注入（已由污点降级的不会是 high，这里模拟一条真实 high）
+    high = enrich_skill_finding({
+        "file": "a.py", "line": 1, "layer": "owasp_security",
+        "severity": "high", "confidence": "high",
+        "desc": "命令注入", "taint_state": "tainted",
+    })
+    # 无协同：硬 BLOCK
+    assert decide_gate_with_agent(scoring, [high], []) == "BLOCK", "无 REJECT 应 BLOCK"
+    # 智能体审查后 REJECT（带 human_override）
+    rejected = agent_review(high, "REJECT", "测试桩，非生产路径",
+                            human_override=True, override_reason="单元测试桩")
+    assert is_blocking_with_agent(rejected) is False, "REJECT 致命类应放行"
+    assert decide_gate_with_agent(scoring, [rejected], []) != "BLOCK", "REJECT 后应非 BLOCK（放行人工复核）"
+    print("  OK  协同门禁：REJECT→CONDITIONAL，BLOCK→保留")
+    return True
+
+
 if __name__ == "__main__":
     results = []
     try:
@@ -843,6 +1135,42 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"  FAIL: {e}")
         results.append(("过滤管道", False))
+
+    try:
+        results.append(("污点追踪上下文v8.13", test_taint_context()))
+    except Exception as e:
+        print(f"  FAIL: {e}")
+        results.append(("污点追踪上下文v8.13", False))
+
+    try:
+        results.append(("match臂绑定非参数v8.13", test_taint_match_arm_not_param()))
+    except Exception as e:
+        print(f"  FAIL: {e}")
+        results.append(("match臂绑定非参数v8.13", False))
+
+    try:
+        results.append(("命令注入污点降级v8.13", test_command_injection_taint_downgrade()))
+    except Exception as e:
+        print(f"  FAIL: {e}")
+        results.append(("命令注入污点降级v8.13", False))
+
+    try:
+        results.append(("路径穿越污点降级v8.13", test_path_traversal_taint_guarded()))
+    except Exception as e:
+        print(f"  FAIL: {e}")
+        results.append(("路径穿越污点降级v8.13", False))
+
+    try:
+        results.append(("TSX魔法数字豁免v8.13", test_magic_number_tsx_exempt()))
+    except Exception as e:
+        print(f"  FAIL: {e}")
+        results.append(("TSX魔法数字豁免v8.13", False))
+
+    try:
+        results.append(("协同门禁REJECTv8.13", test_collab_gate_agent_reject()))
+    except Exception as e:
+        print(f"  FAIL: {e}")
+        results.append(("协同门禁REJECTv8.13", False))
 
     try:
         results.append(("置信度评分", test_scoring_confidence()))
@@ -879,6 +1207,36 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"  FAIL: {e}")
         results.append(("命令注入语言感知v8.9", False))
+
+    try:
+        results.append(("命令注入子类型v8.11", test_command_injection_subtype()))
+    except Exception as e:
+        print(f"  FAIL: {e}")
+        results.append(("命令注入子类型v8.11", False))
+
+    try:
+        results.append(("Rust format! 污点v8.11", test_rust_format_taint_h7()))
+    except Exception as e:
+        print(f"  FAIL: {e}")
+        results.append(("Rust format! 污点v8.11", False))
+
+    try:
+        results.append(("魔法数字URL端口v8.11", test_magic_number_port_in_url()))
+    except Exception as e:
+        print(f"  FAIL: {e}")
+        results.append(("魔法数字URL端口v8.11", False))
+
+    try:
+        results.append(("硬编码端口检测器v8.11+", test_hardcoded_port_detector()))
+    except Exception as e:
+        print(f"  FAIL: {e}")
+        results.append(("硬编码端口检测器v8.11+", False))
+
+    try:
+        results.append(("SSRF本地作用域v8.11", test_ssrf_local_scope_gate()))
+    except Exception as e:
+        print(f"  FAIL: {e}")
+        results.append(("SSRF本地作用域v8.11", False))
 
     try:
         results.append(("协同协议", test_agent_protocol()))

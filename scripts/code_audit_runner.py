@@ -17,7 +17,7 @@ from collections import defaultdict
 # 导入新模块
 try:
     from package_resolver import PackageResolver
-    from smart_detectors import SmartDetectors, apply_all_detectors
+    from smart_detectors import SmartDetectors, apply_all_detectors, TaintContext
     from confidence_engine import ConfidenceEngine, recalculate_score
     from release_artifacts import scan_release_artifacts
     from agent_protocol import build_agent_tasks, apply_verdicts, emit_agent_tasks_json
@@ -28,7 +28,7 @@ try:
 except ImportError:
     _NEW_MODULES = False
 
-SCRIPT_VERSION = "8.10"
+SCRIPT_VERSION = "8.13"
 
 # ── 配置 ──
 
@@ -137,12 +137,20 @@ def scan_file(file_path: str, root_path: str, resolver: Optional[PackageResolver
     # ── 2. 智能逐行检测（SQL/密钥/SSRF/XSS 等全部由 smart_detectors 覆盖）──
     if not is_auto:
         lines = content.split("\n")
+        # v8.13：同文件内污点追踪上下文（命令注入/路径穿越 sink 降级用）
+        # 注意：TaintContext 为模块级类，需用模块名/直接导入访问，
+        # 不可误写为 SmartDetectors.TaintContext（类属性不存在 → 静默失效）。
+        try:
+            taint_ctx = TaintContext.build(lines, language)
+        except Exception:
+            taint_ctx = None
         for i, line in enumerate(lines, 1):
             if is_auto:
                 break
             smart_issues = apply_all_detectors(
                 line, i, language, project_type, file_path,
                 context_lines=lines, line_idx=i - 1,
+                taint_ctx=taint_ctx,
             )
             issues.extend(smart_issues)
 
@@ -325,17 +333,25 @@ def scan_directory(root_path: str, project_type: str = None,
         "owasp_security", "product_security", "business_logic",
         "memory_performance", "ai_hallucination",
     }
+    security_issues = [i for i in filtered.normal
+                       if i.get("severity") in ("critical", "high") and i.get("layer") in BLOCKING_LAYERS]
+    # v8.11：scope=local 的安全问题（规则4：localhost 不构成网络漏洞）不触发硬 BLOCK，
+    # 仅降级为需人工复核（CONDITIONAL）；其余安全高危仍硬 BLOCK。
+    # v8.13：污点分析已判为 clean/guarded（本地/已守卫，非外部输入）的发现，
+    # 以及智能体已 REJECT 的发现，不再计入硬 BLOCK（交由人工 CONDITIONAL 复核）。
     has_security_high = any(
-        i.get("severity") in ("critical", "high") and i.get("layer") in BLOCKING_LAYERS
-        for i in filtered.normal
-    )
+        i.get("scope") != "local"
+        and i.get("taint_state") not in ("clean", "guarded")
+        and i.get("agent_decision") != "reject"
+        for i in security_issues)
+    has_local_only_security = any(i.get("scope") == "local" for i in security_issues)
     has_artifact_block = any(
         a.get("severity") in ("critical", "high") for a in artifact_issues
     )
 
     if veto_hit or grade == "C" or has_security_high or has_artifact_block:
         gate_decision = "BLOCK"          # 禁止发布
-    elif grade == "B" or artifact_issues or any(
+    elif grade == "B" or artifact_issues or has_local_only_security or any(
             i.get("severity") == "mid" for i in filtered.normal):
         gate_decision = "CONDITIONAL"    # 有条件发布（需修复中高危/遗留）
     else:
@@ -347,10 +363,14 @@ def scan_directory(root_path: str, project_type: str = None,
             "致命层存在 critical 级问题（" + ", ".join(scoring.get("veto_layers", [])) + "）→ 否决禁发"
         )
     if has_security_high:
-        sec = [i for i in filtered.normal
-               if i.get("severity") in ("critical", "high") and i.get("layer") in BLOCKING_LAYERS]
+        sec = [i for i in security_issues if i.get("scope") != "local"]
         gate_reasons.append(
-            f"安全/致命层存在 {len(sec)} 个高/严重问题（如 SQL 注入、硬编码密钥）→ 禁止发布"
+            f"安全/致命层存在 {len(sec)} 个高/严重问题（如 SQL 注入、硬编码密钥、RCE）→ 禁止发布"
+        )
+    if has_local_only_security:
+        gate_reasons.append(
+            f"存在 {sum(1 for i in security_issues if i.get('scope') == 'local')} 个 localhost/本地服务暴露类安全问题"
+            "（规则4：不构成网络漏洞）→ 降级为需人工复核，放行前需确认本地服务确有防护"
         )
     artifact_by_sev = {}
     for a in artifact_issues:

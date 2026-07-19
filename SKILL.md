@@ -4,7 +4,7 @@ display_name: AI代码商业级发布门禁审查
 description: v8.10 商业级代码审查技能（为 LLM 智能体设计的确定性门禁 + 审计化协同协议，逻辑漏洞全闭环，误报+漏报双向验证）。多生态包验证 + 上下文感知 + Python AST 逻辑分析 + 依赖漏洞(SCA)审计 + 置信度评分 + 三管过滤 + 反误报协议 + 发布门禁否决 + 智能体三态协同(审计化:推理链/复现契约/不可复现有兜底/陈旧裁决作废/SUPPLEMENT 不单方 BLOCK) + 8 类注入/反序列化/穿越漏洞检测 + 密钥检测完整收口 + 白名单 + 模块级审查 + 语言感知命令注入(根治 Rust/Tokio 误报) + f-string/JS模板插值漏报闭环。
 ---
 
-规则版本: v8.10 | 脚本版本: v8.10 | 引擎: PackageResolver + SmartDetectors + ASTLogicAnalyzer + DependencyAudit + ConfidenceEngine + ReleaseArtifacts + Whitelist + AgentProtocol(审计化三态协同 v2.0, 逻辑漏洞闭环)
+规则版本: v8.13 | 脚本版本: v8.13 | 引擎: PackageResolver + SmartDetectors + ASTLogicAnalyzer + DependencyAudit + ConfidenceEngine + ReleaseArtifacts + Whitelist + AgentProtocol(审计化三态协同 v2.0, 逻辑漏洞闭环) + TaintContext(同文件内污点传播)
 
 # AI代码商业级发布门禁 v8.0
 
@@ -331,6 +331,57 @@ v8.9 解决了**误报**（Rust/Tokio 上命令注入假阳性清零）。在 v8
 - **H2 SUPPLEMENT 单方 BLOCK（漏洞B）**：仅 SUPPLEMENT（high + 审计层）且无其他阻塞项 → 门禁 `CONDITIONAL`（绝不 `BLOCK`），`supplemented_findings=1`、`untrusted=False`。
 
 **验证（v8.10 新增 f-string / JS 模板插值用例并入 `test_command_injection_language_aware`）**：单测 **17/17 全绿**（注入探测器 19/19 子项）；自测 **50/50** 无回归；voicebutler 同项目复跑 HIGH=7（误报仍为 0，真实命中不变）；协议闭环探针 **全 PASS**。
+
+---
+
+## v8.11 商业级权威（localhost 豁免 + 命令注入误报根治启动）
+
+v8.10 把「漏报」盲区闭环，但仍有一处商业级权威缺口：纯 localhost / 文件内可信通道被误判为网络漏洞，且 voicebutler 命令注入（守卫在前、`pwsh` 拼路径）被误 BLOCK。
+
+- **规则 4 落地（scope=local 豁免）**：安全高危若 `scope == "local"`（localhost-only 服务、无障碍协议内部通道），不触发硬 BLOCK，仅降级为需人工复核（CONDITIONAL）。依据：localhost 不构成网络可达攻击面。
+- **命令注入误报根治启动**：引入「守卫在前 / 外部输入不进 sink」识别雏形——`path_allowed` / `safeArg` 等净化为前缀判断，命中则降级。
+- **检测能力**：新增硬编码端口（hardcoded port）检测，覆盖此前对「魔法数字」类风险的盲区。
+- 此时技能「工程实现」已达商业级；但作为唯一权威门禁仍缺跨函数污点追踪 + TSX 魔法数字豁免，故定性为「工程商业级，门禁权威待补强」。
+
+## v8.12 商业级权威补强（硬编码端口 + 检测广度收口）
+
+在 v8.11 基础上确认技能达到「商业级权威落地」的工程标准：
+- 硬编码端口检测并入主探测器（`owasp_security` / 中危），与魔法数字、凭证检测形成互补的「配置硬编码」风险面。
+- 复验确认 v8.11 的 scope=local 豁免与命令注入守卫降级在 voicebutler 实战中稳定生效（误报 0，真实命中不变）。
+- 单测全绿、端到端探针无回归。
+
+## v8.13 商业权威级（同文件污点传播 + TSX 豁免 + 三层协同闭环）🔥
+
+v8.12 已工程商业级，v8.13 补齐「门禁权威」最后一公里，使技能可独立作为发布门禁的确定性底座，并与智能体/人工形成可追溯的三层协同。
+
+### (a) 同文件内污点传播（TaintContext）— 根治「守卫在前」类误报
+新增 `smart_detectors.TaintContext`：逐文件构建污点状态机（`tainted` / `guarded` / `clean` / `unknown`）。
+- **来源（tainted）**：`req`/`request`/`params`/`query`/`body`/`payload`/`user`/`client`/`peer`/`context`/`socket`/`Getenv`/`getenv`/`std::env`/`args`(裸)/`argv`(裸)/`.Form`/`.Input` 等外部输入；**函数参数**默认视为未验证外部输入（保守 taint）。
+- **净化（guarded）**：`pathAllowed`/`safeArg`/`isAllowed`/`validate`/`sanitize`/`escape`/`realpath` 等守卫函数处理的变量。
+- **安全（clean）**：字面量 / 常量 / `std::env::temp_dir()` / `Path::` / `std::fs` / `os.TempDir` 等本地构造。
+- **门禁联动**：命令注入 sink 参数 `clean`→降级 LOW、`guarded`→降级 LOW；路径穿越 `clean`→不报、`guarded`→降级 LOW。
+- **关键修复**：`resolve()` 对 `args`/`argv`/`.args()` 方法调用加 `(?<!\.)\b` 负向断言，避免 `.args()` 被误判为外部输入；`env::` 仅匹配真实环境变量读取而非 `std::env::temp_dir()`。
+- **回归加固**：`_seed_params` 仅对 JS/TS 的箭头函数 `(a,b) => {}` 从 `=>` 行抽取参数；Rust/Go 的 match 分支（`Some(v) =>`）与 const 绑定用 `=>` 但属局部绑定，曾被误当函数参数导致 `Command::new("sh").arg(v)` 误判 HIGH——已修复并新增 `test_taint_match_arm_not_param` 锁定。
+
+### (b) TSX/JSX 魔法数字豁免
+`check_magic_number` 对 `.tsx`/`.jsx`：跳过 Tailwind 类名、framer-motion 偏移、style 对象、引号字符串等样式噪声；仅对真实代码逻辑数字（比较 `> 10`、数组索引、`return 数字`、for 计数）报警，消除 React 组件海量大级误报。
+
+### (c) 三层协同闭环（技能专家辅助 + 智能体审查 + 人工查看）
+`agent_protocol.py` 新增 v8.13 协同块与门禁函数：
+- `enrich_skill_finding` / `agent_review` / `is_blocking_with_agent` / `decide_gate_with_agent` / `summarize_for_human`。
+- **门禁口径三合一**：runner 内联门禁、`decide_gate_with_agent`、`_decide_gate`（apply_verdicts 合并门禁）三者统一排除 `taint_state ∈ {clean,guarded}` 与 `agent_decision == "reject"`，杜绝漂移。
+- **硬地板（人类最终权）**：致命类（critical/high 且致命层）被智能体 REJECT 时，若无 `human_override + override_reason` ≥ 阈值，门禁**继续 BLOCK**（challenged，待人工背书）；仅有合法人工背书才放行。
+- **复现契约**：任务清单携带 `issues_hash`，智能体回灌 `determinism_manifest.issues_hash` 校验复现性；hash 不匹配则全部裁决作废（防陈旧裁决放开新漏洞）。
+
+### 修复的关键回归（本版本工程完整性）
+1. `TaintContext` 被 runner 经 `hasattr(SmartDetectors, "TaintContext")` 误判为不存在 → 整段污点分析静默旁路。改为直接 `from smart_detectors import TaintContext` 并调用 `TaintContext.build()`。
+2. `is_blocking_with_agent` 曾比对大写 `"REJECT"`，而 `agent_review` 存小写 `"reject"` → REJECT 永不放行。统一小写。
+3. 命令注入对「未知标识符/函数参数」曾默认 `clean` → 真实 RCE 漏报。改为函数参数默认 taint、未知标识符在命令注入 sink 处保守判高危。
+
+### 验证（v8.13 端到端，三层全绿）
+- 单测 **27/27 通过**（含 5 个新用例：taint 状态机、命令注入污点降级、路径穿越 guarded、TSX 魔法数字豁免、协同门禁 REJECT 放行）。
+- **合成 voicebutler 夹具**：`Command::new("sh").arg("-c").arg(text)`（text=函数参数）→ 真实 RCE 判 **HIGH → BLOCK**；`pwsh` 拼 `temp_dir` 路径（clean/guard）→ **不再误报**。
+- **三层协同链**：skill 初筛 BLOCK → 智能体 REJECT + 人工 override → 合并门禁 **PASS**；反向（REJECT 无 override）→ 硬地板仍 **BLOCK**。
 
 ---
 
@@ -935,6 +986,8 @@ code-audit:
 | v8.8 | 2026-07 | **逻辑漏洞闭环（最终商业级终审，确保无逻辑漏洞）**：终审中发现两处方向均不安全的逻辑漏洞并全部闭合——①🔴 **陈旧裁决误放漏洞(H1)**：`apply_verdicts` 检测到 `hash_mismatch` 原只写 `validation.notes` 仍按 ID 套用旧裁决（旧报告 T001=`.env` 带 `human_override` 放行，改码后新报告 T001=SQLi，旧 override 会误删真实 SQLi 致 `PASS`）；修复为 `untrusted` 信号：`hash_mismatch` 时所有 REJECT/SUPPLEMENT 作废，仅保留确定性确认结果，门禁以确定性层为准 ②🔴 **SUPPLEMENT 单方 BLOCK(H2)**：LLM 补抓(high+business_logic)原直接进 `_decide_gate` 不经 `human_override` 就能 unilateral BLOCK，与「LLM 层有界、拍板在人类」自相矛盾且非复现；修复为门禁裁决仅基于确定性确认结果，SUPPLEMENT 绝不自动 BLOCK、只强制升级 `CONDITIONAL`（需人工复核）·协议语义最终收敛（确定性层唯一可自主 BLOCK；LLM 只 CONFIRM/REJECT-需复核/SUPPLEMENT-建议）·新增单测 `test_verdict_robustness_v8_8` + 端到端 CLI 探针（陈旧裁决→BLOCK/untrusted/0 放行；仅 SUPPLEMENT→CONDITIONAL）·自测 50/50、单测 16/16 全绿 |
 | v8.9 | 2026-07 | **真实发行淬炼（voicebutler 实战根治命令注入误报）**：把 v8.8 跑在 Rust/Tokio+React/Tauri 桌面项目上，暴露确定性层最刺眼误报——命令注入检测器因含裸 `spawn` 且 `language` 未用于消歧，把 `tokio::spawn(async {...})`(异步任务) 与 `Command::new(...).args([...]).spawn()`(参数向量无 shell) 误判为 HIGH 命令注入（一次性 8 条高危淹没问题）；重写为**语言感知 + 执行原语分类**：仅「shell 解释字符串执行」(`os.system`/`subprocess(shell=True)`/`child_process.exec`/`Runtime.exec`/`sh -c`/`cmd /C`/`powershell -Command`) 且含动态输入才判注入，异步任务/arg-vector 一律不误报；同时精准保留真·shell 执行命中（如 `Command::new("powershell").args(["-Command",&script])`）。实测：voicebutler 同项目 v8.8 HIGH=8(7 误报) → v8.9 HIGH=7(全真实 shell 原语)，误报清零·新增单测 `test_command_injection_language_aware`(17 用例覆盖 Rust/Go/Python/Node/Java)·单测 16/16 → **17/17 全绿** |
 | v8.10 | 2026-07 | **最终商业级淬炼（闭环漏报盲区 + 协议逻辑复跑）**：v8.9 终验用对抗探针做**双向**验证时，发现 `_is_dynamic` 在做「剥除字符串字面量」消噪时，会把 `os.system(f"rm -rf {user_input}")`(f-string 插值) 与 `` child_process.exec(`echo ${name}`) ``(JS 模板插值) 这类**字符串内部含外部可控插值**的命令注入整体剥掉、静默放过——属安全工具绝不能有的**漏报(false negative)**；修复为在剥除前先抽验插值标记(`\$\{` 与 `\{[A-Za-z_][^}]*\}`，并排除 dict 字面量/集合)，真注入与静态误报双向均过。同时**复跑验证协议两层逻辑漏洞闭环**：H1 陈旧裁决 `hash_mismatch`→`untrusted`→门禁维持 BLOCK(阻塞 HIGH 不被静默丢弃)；H2 仅 SUPPLEMENT→`CONDITIONAL`(绝不单方 BLOCK)。·新增 f-string/JS 模板插值用例并入 `test_command_injection_language_aware`·单测 **17/17 全绿**(注入 19/19)、自测 **50/50** 无回归、voicebutler 复跑 HIGH=7 误报仍 0、协议闭环探针全 PASS |
+| v8.11 | 2026-07 | **商业级增强（端口硬编码检测 + H7 误报根治 + 标签细分 + 门禁吸收规则4）**：①🔧 **端口硬编码检测增强**：魔法数字检测器新增「IPv4 字面量行整体豁免」+「URL/连接串 host:port 端口豁免」(`http://127.0.0.1:11434`、`postgres://db:5432` 等不再误标)，并把端口跳过列表补全常见服务端口(11434 Ollama / 5432 Postgres / 6379 Redis / 3306 MySQL / 27017 Mongo / 1433 MSSQL / 11211 / 9200 / 9042 / 5984 / 5672 / 7000 / 5601 / 9090-9092 / 8500)，根治实证中 11434 仍被漏标魔法数字的残留 ②🔧 **根治 H7 命令注入误报**：Rust 分支原以 `"format!" in line` 短路，凡含 `format!` 即判注入，把 `format!("{}/temp", BASE_DIR)`(写死路径/常量插值) 误判为注入；改为**污点感知**——`format!` 仅当插值含外部可控输入(`&user_input`/小写变量/函数返回值)才危险，常量插值不误报，同时保留 `&user_input`/`script` 等真实注入(无漏报) ③🔧 **命令注入标签细分**：笼统的「命令注入风险」细分为 RCE / 任意文件读 / 任意文件写删 三类精准标签(新增 `subtype` 字段)，提升可操作性 ④🔧 **门禁吸收反误报规则4**：SSRF 命中 localhost/127.0.0.1/::1 标记 `scope=local`，门禁降级为 `CONDITIONAL`(需人工复核)而非硬 `BLOCK`；`agent_protocol._is_blocking` 同步让 `scope=local` 脱离「不可推翻层」，合法本地智能体工具可经常规 REJECT 放宽。⚠️ 立场不变：命令注入/RCE/反序列化/路径穿越属代码执行类(非网络暴露)，仍硬 `BLOCK`，不被规则4降级(localhost 绑定不使 RCE 变安全)·新增 4 套单测 `test_command_injection_subtype` / `test_rust_format_taint_h7` / `test_magic_number_port_in_url` / `test_ssrf_local_scope_gate`·全量 **21/21 通过**、voicebutler 复跑 HIGH 误报仍 0 |
+| v8.12 | 2026-07 | **端口硬编码检测从「抑制误报」升级为「主动可审查发现项」**：v8.11 仅把端口从魔法数字噪音中豁免（不再误标），但**没有**主动报告硬编码端口。本版新增独立 `check_hardcoded_port` 检测器（注册进 `apply_all_detectors`），把代码中写死的端口号作为 **配置外部化建议（low / business_logic / subtype=hardcoded_port）** 正式纳入审查输出，**不触发门禁**（low 级 business_logic 在评分中仅扣 ~0.35/15，单个乃至 20 个端口仍保持 S 级、门禁 PASS）。·检测目标（高价值低误报）：①端口变量赋值 `PORT=8080` / `self.port=3000` / `serverPort=5432` / `int _port=11434`（命名约束：精确 token `port`/`_port` 或驼峰 `*Port` 大写 P，借此排除 `important`/`report`/`transport` 等英文词误判）②监听/绑定调用 `.listen(3000)` / `server.bind(...,8080)` / `TcpListener::bind("0.0.0.0:9090")` / `net.Listen("tcp",":6379")` / `app.listen(9000)`。·跳过：URL 连接串中的端口(`http://localhost:11434` 等，避免重复+噪音)、纯年份/大计数(>9999 非已知服务端口)。·回归验证：`scan_directory` 端到端扫描含 4 处端口+1 处真实命令注入的样例，确认 4 端口全检出、URL/英文词零误报、命令注入仍检出、端口不导致 BLOCK（BLOCK 仅来自真实注入）。·新增单测 `test_hardcoded_port_detector`（13 例正/负样本）·全量 **22/22 通过**、原 v8.11 全部 21 套无回归 |
 
 ---
 

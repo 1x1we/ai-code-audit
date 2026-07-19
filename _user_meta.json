@@ -1,16 +1,23 @@
 {
   "name": "ai-code-audit",
-  "version": "8.0",
-  "description": "商业级代码审计门禁 — 包生态验证 + 上下文感知 + 置信度评分 + 三管过滤",
+  "version": "8.13",
+  "description": "商业级代码审计发布门禁 — 包生态验证 + 上下文感知 + 同文件内污点传播 + 置信度评分 + 三层协同(技能辅助+智能体审查+人工查看) + 发布门禁硬地板",
   "installedAt": "N/A",
   "source": "custom",
   "capabilities": [
-    "多语言包名验证（PyPI/npm/NuGet/Go/Rust stdlib）",
-    "项目命名空间自动识别",
-    "上下文感知魔法数字检测",
-    "CLI vs 库 调试残留智能区分",
-    "置信度加权评分",
-    "三管输出过滤（strict/normal/release）",
-    "实时自测试"
+    "多语言扫描：Python/JS/TS/Vue/C#/Go/Rust/C/C++/Java/Kotlin",
+    "包生态验证（PyPI/npm/NuGet/Go/Rust stdlib + 项目命名空间）",
+    "上下文感知检测：魔法数字安全豁免、CLI vs 库调试残留、空 catch 注释、参数化 SQL",
+    "8 类安全注入：SQL/XSS/命令/代码/路径穿越/SSRF/不安全反序列化/弱加密",
+    "密钥硬编码检测（sk-*/AKIA/通用命名）",
+    "Python AST 逻辑分析（除零/open未with/无限循环/None解引用）",
+    "依赖漏洞 SCA（精选 CVE 库）",
+    "发布前遗留文件检测（.env/.pem/.key/.js.map/.bak 等）",
+    "同文件内污点传播 TaintContext（消除『守卫在前/外部输入不进 sink』类误报）",
+    "TSX/JSX 魔法数字豁免（仅报代码逻辑数字，跳过样式噪声）",
+    "置信度加权评分（80 分制 S/A/B/C）",
+    "三层协同协议：技能确定性初筛 + 智能体三态审查 + 人工查看，致命类硬地板兜底",
+    "发布门禁三态 BLOCK/CONDITIONAL/PASS + 复现契约 issues_hash",
+    "实时自测试（50 项）+ 核心单元测试（28 套）"
   ]
 }

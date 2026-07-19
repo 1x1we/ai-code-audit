@@ -132,7 +132,13 @@ def _norm_reasoning(v: Dict) -> str:
 
 
 def _is_blocking(issue: Dict) -> bool:
-    """该发现是否属于 LLM 不可静默推翻的致命类（= 门禁 BLOCK 触发项）。"""
+    """该发现是否属于 LLM 不可静默推翻的致命类（= 门禁 BLOCK 触发项）。
+
+    v8.11：scope=local 的安全问题（反误报规则4：localhost 不构成网络漏洞）
+    不在不可推翻之列，可由智能体以常规 REJECT 放宽（仍进入需人工复核的 CONDITIONAL 档）。
+    """
+    if issue.get("scope") == "local":
+        return False
     layer = issue.get("layer", "")
     severity = issue.get("severity", "")
     return layer in NON_OVERRIDABLE_LAYERS and severity in NON_OVERRIDABLE_SEVERITIES
@@ -255,17 +261,31 @@ def build_agent_tasks(report: Dict) -> Tuple[List[Dict], Dict[str, tuple]]:
 
 def _decide_gate(scoring: Dict, normal_issues: List[Dict],
                  artifact_issues: List[Dict]) -> str:
-    """与 code_audit_runner.scan_directory 内的门禁裁决逻辑保持一致。"""
+    """与 code_audit_runner.scan_directory 内的门禁裁决逻辑保持一致。
+
+    v8.13：与 decide_gate_with_agent / runner 内联门禁三者口径统一——
+    污点分析已判 clean/guarded（本地/已守卫，非外部输入）的发现，
+    以及智能体已 REJECT 的发现，不计入硬 BLOCK。
+    """
     grade = scoring.get("grade", "C")
     veto_hit = scoring.get("veto_hit", False)
+    security_issues = [i for i in normal_issues
+                       if i.get("severity") in ("critical", "high")
+                       and i.get("layer") in NON_OVERRIDABLE_LAYERS]
     has_security_high = any(
-        i.get("severity") in ("critical", "high") and i.get("layer") in NON_OVERRIDABLE_LAYERS
-        for i in normal_issues
-    )
+        i.get("scope") != "local"
+        and i.get("taint_state") not in ("clean", "guarded")
+        and i.get("agent_decision") != "reject"
+        for i in security_issues)
+    has_local_only = any(
+        i.get("scope") == "local"
+        and i.get("taint_state") not in ("clean", "guarded")
+        for i in security_issues)
     has_artifact_block = any(a.get("severity") in ("critical", "high") for a in artifact_issues)
     if veto_hit or grade == "C" or has_security_high or has_artifact_block:
         return "BLOCK"
-    if grade == "B" or artifact_issues or any(i.get("severity") == "mid" for i in normal_issues):
+    if grade == "B" or artifact_issues or has_local_only or any(
+            i.get("severity") == "mid" for i in normal_issues):
         return "CONDITIONAL"
     return "PASS"
 
@@ -572,6 +592,99 @@ def apply_verdicts(report: Dict, verdicts: Dict) -> Dict:
         "audit_trail": audit_trail,
         "validation": validation,
     }
+
+
+# ─────────────────────────────────────────────────────────────
+# v8.13：三层协同协议（技能专家辅助 + 智能体审查 + 人工查看）
+# ─────────────────────────────────────────────────────────────
+COLLAB_TIERS = {
+    "skill": "确定性脚本初筛（专家辅助）：产出带 confidence / taint_state / scope 的发现，"
+             "同文件内污点分析已消除『守卫在前 / 外部输入不进 sink』类误报。",
+    "agent": "LLM 智能体审查：对 skill 发现逐条 CONFIRM / REJECT / SUPPLEMENT，必须附推理链"
+             "（reasoning + evidence），REJECT 致命类需 human_override。",
+    "human": "人工查看：最终裁决与发布门禁放行；所有 skill/agent 结论均可在报告中溯源。",
+}
+
+
+def enrich_skill_finding(f: Dict) -> Dict:
+    """给 skill 原始发现补上协同元数据（origin / taint_state / auto_block_eligible）。"""
+    g = dict(f)
+    g.setdefault("origin", "skill")
+    layer = f.get("layer", "")
+    sev = f.get("severity", "")
+    scope = f.get("scope")
+    state = f.get("taint_state")
+    # 自动可 BLOCK 条件：致命层 + high/critical + 非本地 + 污点未消除
+    auto_block = (
+        layer in NON_OVERRIDABLE_LAYERS
+        and sev in NON_OVERRIDABLE_SEVERITIES
+        and scope != "local"
+        and state not in ("clean", "guarded")
+    )
+    g["auto_block_eligible"] = auto_block
+    return g
+
+
+def agent_review(finding: Dict, decision: str, note: str = "",
+                 human_override: bool = False, override_reason: str = "") -> Dict:
+    """智能体对单条 skill 发现的裁决。decision ∈ {CONFIRM, REJECT, SUPPLEMENT}。
+
+    返回副本，附 agent_decision / agent_note；REJECT 致命类可带 human_override 放宽门禁。
+    """
+    g = dict(finding)
+    g["origin"] = "skill"
+    g["agent_decision"] = decision.lower()  # 统一小写，与门禁判定一致
+    g["agent_note"] = note
+    if human_override:
+        g["human_override"] = True
+        g["override_reason"] = override_reason
+    return g
+
+
+def is_blocking_with_agent(issue: Dict) -> bool:
+    """协同版门禁：技能判 BLOCK 项，若智能体已 REJECT 则放行（降级人工 CONDITIONAL）。"""
+    if issue.get("agent_decision") == "reject":
+        return False
+    return _is_blocking(issue)
+
+
+def decide_gate_with_agent(scoring: Dict, normal_issues: List[Dict],
+                           artifact_issues: List[Dict]) -> str:
+    """协同版门禁裁决，吸收智能体 REJECT 与污点降级。"""
+    grade = scoring.get("grade", "C")
+    veto_hit = scoring.get("veto_hit", False)
+    sec = [i for i in normal_issues
+           if i.get("severity") in ("critical", "high")
+           and i.get("layer") in NON_OVERRIDABLE_LAYERS
+           and i.get("scope") != "local"
+           and i.get("taint_state") not in ("clean", "guarded")
+           and i.get("agent_decision") != "reject"]
+    has_security_high = bool(sec)
+    has_artifact_block = any(a.get("severity") in ("critical", "high") for a in artifact_issues)
+    if veto_hit or grade == "C" or has_security_high or has_artifact_block:
+        return "BLOCK"
+    if grade == "B" or artifact_issues or any(i.get("severity") == "mid" for i in normal_issues):
+        return "CONDITIONAL"
+    return "PASS"
+
+
+def summarize_for_human(reconciled: List[Dict]) -> str:
+    """人工查看摘要：按 origin / agent_decision 分组，便于最终裁决。"""
+    by_tier = {}
+    for it in reconciled:
+        tier = it.get("origin", "skill")
+        decision = it.get("agent_decision", "pending")
+        key = f"[{tier}] {decision}"
+        by_tier.setdefault(key, 0)
+        by_tier[key] += 1
+    lines = ["# 协同审查摘要（技能辅助 → 智能体审查 → 人工查看）"]
+    lines.append("")
+    for k, v in sorted(by_tier.items(), key=lambda x: -x[1]):
+        lines.append(f"- {k}: {v}")
+    lines.append("")
+    lines.append("说明：skill 初筛为确定性辅助信号；智能体 REJECT 致命类释放门禁；"
+                 "最终发布需人工确认放行。")
+    return "\n".join(lines)
 
 
 def emit_agent_tasks_json(report: Dict, indent: int = 2) -> str:
